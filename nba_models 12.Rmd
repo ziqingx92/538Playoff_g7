@@ -1,0 +1,1215 @@
+---
+title: "NBA Game Prediction Models: Spread, Total & OREB"
+author: "Group [Your Group Number]"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  fig.align  = "center"
+)
+```
+
+---
+
+# 0. Libraries & Global Settings
+
+```{r libraries}
+library(tidyverse)
+library(lubridate)
+library(glmnet)        # Ridge / Lasso
+library(randomForest)  # Random Forest
+library(xgboost)       # XGBoost
+library(rpart)         # Regression Tree
+library(rpart.plot)    # Tree visualisation
+library(nnet)          # Neural Network
+library(zoo)           # Rolling averages
+library(knitr)         # Tables
+library(kableExtra)    # Styled tables
+
+set.seed(42)
+
+# Global MAE helper
+mae <- function(actual, predicted) mean(abs(actual - predicted), na.rm = TRUE)
+```
+
+---
+
+# 1. Data Loading & Exploration
+
+```{r load-data}
+df_raw <- read.csv("ready_df.csv", stringsAsFactors = FALSE)
+df_raw$gameDate <- as.Date(df_raw$gameDate)
+
+cat("Dimensions :", nrow(df_raw), "rows x", ncol(df_raw), "columns\n")
+cat("Date range :", as.character(min(df_raw$gameDate)),
+    "to", as.character(max(df_raw$gameDate)), "\n")
+cat("Teams      :", n_distinct(c(df_raw$Home, df_raw$Away)), "\n")
+```
+
+```{r explore-targets}
+# Distribution of the three outcome variables
+df_raw %>%
+  select(spread, total, OREB) %>%
+  summary() %>%
+  kable(caption = "Summary Statistics: Outcome Variables") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+```{r dist-plots, fig.height=4}
+par(mfrow = c(1, 3))
+hist(df_raw$spread, breaks = 30, col = "steelblue",
+     main = "Spread Distribution", xlab = "Spread (Home - Away)")
+hist(df_raw$total,  breaks = 30, col = "darkorange",
+     main = "Total Distribution",  xlab = "Total Points")
+hist(df_raw$OREB,   breaks = 30, col = "forestgreen",
+     main = "OREB Distribution",   xlab = "Total Offensive Rebounds")
+par(mfrow = c(1, 1))
+```
+
+---
+
+# 2. Feature Engineering
+
+## 2a. Differential & Ratio Features
+
+```{r engineer-raw}
+df <- df_raw %>%
+  arrange(gameDate) %>%
+  mutate(
+    # --- Shooting differentials ---
+    diff_eFG          = home_eFGpct - away_eFGpct,
+    diff_FGpct        = home_fieldGoalsPercentage - away_fieldGoalsPercentage,
+    diff_3Ppct        = home_threePointersPercentage - away_threePointersPercentage,
+    diff_FTpct        = home_freeThrowsPercentage - away_freeThrowsPercentage,
+
+    # --- Volume differentials ---
+    diff_FGA          = home_fieldGoalsAttempted - away_fieldGoalsAttempted,
+    diff_3PA          = home_threePointersAttempted - away_threePointersAttempted,
+    diff_FTA          = home_freeThrowsAttempted - away_freeThrowsAttempted,
+
+    # --- Rebounding differentials ---
+    diff_OREB         = home_reboundsOffensive - away_reboundsOffensive,
+    diff_DREB         = home_reboundsDefensive - away_reboundsDefensive,
+    diff_TREB         = home_reboundsTotal - away_reboundsTotal,
+    diff_OBRpct       = home_OBRpct - away_OBRpct,
+    diff_DBRpct       = home_DBRpct - away_DBRpct,
+
+    # --- Playmaking / turnover differentials ---
+    diff_assists      = home_assists - away_assists,
+    diff_turnovers    = home_turnovers - away_turnovers,
+    diff_TOVpct       = home_turnoverPercentage - away_turnoverPercentage,
+    diff_steals       = home_steals - away_steals,
+    diff_blocks       = home_blocks - away_blocks,
+
+    # --- Pace / tempo proxies ---
+    total_FGA         = home_fieldGoalsAttempted + away_fieldGoalsAttempted,
+    total_FTA         = home_freeThrowsAttempted + away_freeThrowsAttempted,
+    total_TOV         = home_turnovers + away_turnovers,
+    total_OREB        = home_reboundsOffensive + away_reboundsOffensive,
+    total_DREB        = home_reboundsDefensive + away_reboundsDefensive,
+
+    # --- Win percentage features ---
+    diff_winPct       = home_winPct - away_winPct,
+    sum_winPct        = home_winPct + away_winPct,
+    ratio_winPct      = (home_winPct + 0.01) / (away_winPct + 0.01),
+
+    # --- Scoring component sums (useful for Total model) ---
+    sum_FGM           = home_fieldGoalsMade + away_fieldGoalsMade,
+    sum_3PM           = home_threePointersMade + away_threePointersMade,
+    sum_FTM           = home_freeThrowsMade + away_freeThrowsMade,
+    sum_assists       = home_assists + away_assists,
+    sum_benchPoints   = home_benchPoints + away_benchPoints,
+    sum_paintPoints   = home_pointsInThePaint + away_pointsInThePaint,
+    sum_fastBreak     = home_pointsFastBreak + away_pointsFastBreak,
+    sum_secondChance  = home_pointsSecondChance + away_pointsSecondChance,
+
+    # --- Ratio features ---
+    ratio_eFG         = home_eFGpct / (away_eFGpct + 1e-6),
+
+    # --- Season label ---
+    season = ifelse(gameDate < as.Date("2025-10-01"), "2024-25", "2025-26")
+  )
+
+cat("Columns after raw feature engineering:", ncol(df), "\n")
+```
+
+## 2b. Rolling / Lagged Features (5-game & 10-game windows)
+
+> **Rationale:** A team's recent performance (last 5 or 10 games) is more predictive
+> of their next game than season-long averages. Rolling means act as a smooth
+> signal of current form, while 1-game lags capture momentum.
+
+```{r rolling-helper}
+# Lag of rolling mean: excludes the current game (no leakage)
+roll_lag <- function(x, k = 5) {
+  lag(rollmeanr(x, k = k, fill = NA, align = "right"), 1)
+}
+```
+
+```{r compute-rolling}
+# Stack home and away games into a single long table per team
+team_games <- bind_rows(
+  df %>%
+    select(gameDate, team = Home,
+           pts    = home_teamScore,
+           oreb   = home_reboundsOffensive,
+           dreb   = home_reboundsDefensive,
+           fgpct  = home_fieldGoalsPercentage,
+           efg    = home_eFGpct,
+           tov    = home_turnovers,
+           obrpct = home_OBRpct) %>%
+    mutate(side = "home"),
+  df %>%
+    select(gameDate, team = Away,
+           pts    = away_teamScore,
+           oreb   = away_reboundsOffensive,
+           dreb   = away_reboundsDefensive,
+           fgpct  = away_fieldGoalsPercentage,
+           efg    = away_eFGpct,
+           tov    = away_turnovers,
+           obrpct = away_OBRpct) %>%
+    mutate(side = "away")
+) %>%
+  arrange(team, gameDate) %>%
+  group_by(team) %>%
+  mutate(
+    roll_pts5    = roll_lag(pts,    5),
+    roll_oreb5   = roll_lag(oreb,   5),
+    roll_dreb5   = roll_lag(dreb,   5),
+    roll_fgpct5  = roll_lag(fgpct,  5),
+    roll_efg5    = roll_lag(efg,    5),
+    roll_tov5    = roll_lag(tov,    5),
+    roll_obrpct5 = roll_lag(obrpct, 5),
+    roll_pts10   = roll_lag(pts,   10),
+    roll_oreb10  = roll_lag(oreb,  10),
+    lag_pts      = lag(pts,  1),
+    lag_oreb     = lag(oreb, 1),
+    lag_tov      = lag(tov,  1)
+  ) %>%
+  ungroup()
+```
+
+```{r merge-rolling}
+home_roll <- team_games %>%
+  filter(side == "home") %>%
+  select(gameDate, Home = team,
+         roll_pts5, roll_oreb5, roll_dreb5, roll_fgpct5, roll_efg5,
+         roll_tov5, roll_obrpct5, roll_pts10, roll_oreb10,
+         lag_pts, lag_oreb, lag_tov) %>%
+  rename_with(~ paste0("home_", .), -c(gameDate, Home))
+
+away_roll <- team_games %>%
+  filter(side == "away") %>%
+  select(gameDate, Away = team,
+         roll_pts5, roll_oreb5, roll_dreb5, roll_fgpct5, roll_efg5,
+         roll_tov5, roll_obrpct5, roll_pts10, roll_oreb10,
+         lag_pts, lag_oreb, lag_tov) %>%
+  rename_with(~ paste0("away_", .), -c(gameDate, Away))
+
+df <- df %>%
+  left_join(home_roll, by = c("gameDate", "Home")) %>%
+  left_join(away_roll, by = c("gameDate", "Away")) %>%
+  mutate(
+    diff_roll_pts5   = home_roll_pts5  - away_roll_pts5,
+    diff_roll_oreb5  = home_roll_oreb5 - away_roll_oreb5,
+    diff_roll_efg5   = home_roll_efg5  - away_roll_efg5,
+    diff_roll_tov5   = home_roll_tov5  - away_roll_tov5,
+    sum_roll_pts5    = home_roll_pts5  + away_roll_pts5,
+    sum_roll_oreb5   = home_roll_oreb5 + away_roll_oreb5,
+    diff_roll_pts10  = home_roll_pts10 - away_roll_pts10,
+    sum_roll_pts10   = home_roll_pts10 + away_roll_pts10
+  )
+
+cat("Total columns after all engineering:", ncol(df), "\n")
+```
+
+## 2c. Feature Set Definitions
+
+```{r feature-sets}
+raw_features <- c(
+  "diff_eFG", "diff_FGpct", "diff_3Ppct", "diff_FTpct",
+  "diff_FGA", "diff_3PA", "diff_FTA",
+  "diff_OREB", "diff_DREB", "diff_TREB",
+  "diff_OBRpct", "diff_DBRpct",
+  "diff_assists", "diff_turnovers", "diff_TOVpct",
+  "diff_steals", "diff_blocks",
+  "total_FGA", "total_FTA", "total_TOV", "total_DREB",
+  "diff_winPct", "sum_winPct",
+  "sum_FGM", "sum_3PM", "sum_FTM",
+  "sum_assists", "sum_benchPoints",
+  "sum_paintPoints", "sum_fastBreak", "sum_secondChance",
+  "ratio_eFG", "ratio_winPct"
+)
+
+rolling_features <- c(
+  "home_roll_pts5",  "away_roll_pts5",  "diff_roll_pts5",
+  "home_roll_oreb5", "away_roll_oreb5", "diff_roll_oreb5",
+  "home_roll_efg5",  "away_roll_efg5",  "diff_roll_efg5",
+  "home_roll_tov5",  "away_roll_tov5",  "diff_roll_tov5",
+  "home_roll_fgpct5","away_roll_fgpct5",
+  "home_roll_dreb5", "away_roll_dreb5",
+  "home_roll_obrpct5","away_roll_obrpct5",
+  "sum_roll_pts5",   "sum_roll_oreb5",
+  "home_roll_pts10", "away_roll_pts10", "diff_roll_pts10", "sum_roll_pts10",
+  "home_roll_oreb10","away_roll_oreb10",
+  "home_lag_pts",    "away_lag_pts",
+  "home_lag_oreb",   "away_lag_oreb",
+  "home_lag_tov",    "away_lag_tov",
+  "diff_winPct",     "sum_winPct",      "ratio_winPct"
+)
+
+all_features <- union(raw_features, rolling_features)
+
+# OREB-specific subsets (rebounding-focused)
+oreb_extra_raw <- c(
+  "home_reboundsOffensive", "away_reboundsOffensive",
+  "home_reboundsDefensive", "away_reboundsDefensive",
+  "home_OBRpct", "home_DBRpct", "away_OBRpct", "away_DBRpct",
+  "diff_OBRpct", "diff_DBRpct", "diff_OREB", "diff_DREB",
+  "total_DREB",
+  "home_fieldGoalsAttempted", "away_fieldGoalsAttempted", "total_FGA",
+  "diff_winPct", "sum_winPct"
+)
+
+oreb_extra_roll <- c(
+  "home_roll_oreb5",  "away_roll_oreb5",  "diff_roll_oreb5",  "sum_roll_oreb5",
+  "home_roll_oreb10", "away_roll_oreb10",
+  "home_roll_dreb5",  "away_roll_dreb5",
+  "home_roll_fgpct5", "away_roll_fgpct5",
+  "home_roll_obrpct5","away_roll_obrpct5",
+  "home_lag_oreb",    "away_lag_oreb",
+  "diff_winPct",      "sum_winPct"
+)
+
+cat("Raw feature count    :", length(raw_features), "\n")
+cat("Rolling feature count:", length(rolling_features), "\n")
+cat("Combined feature count:", length(all_features), "\n")
+```
+
+---
+
+# 3. Train / Test Split (Chronological 80/20)
+
+```{r train-test-split}
+split_date <- as.Date(quantile(as.numeric(df$gameDate), 0.80),
+                      origin = "1970-01-01")
+cat("Train cutoff date:", as.character(split_date), "\n")
+
+train_df <- df %>% filter(gameDate <= split_date)
+test_df  <- df %>% filter(gameDate  > split_date)
+
+cat(sprintf("Train: %d rows | Test: %d rows\n", nrow(train_df), nrow(test_df)))
+```
+
+---
+
+# 4. Results Storage & Model Store
+
+```{r init-storage}
+results      <- tibble(target      = character(),
+                       model       = character(),
+                       feature_set = character(),
+                       train_MAE   = numeric(),
+                       test_MAE    = numeric())
+
+model_store  <- list()   # Persist fitted models for later prediction
+```
+
+---
+
+# 5. SPREAD Models
+
+> **Target:** `spread = home_teamScore - away_teamScore`
+
+## 5a. Model Loop (Raw | Rolling | All features)
+
+```{r spread-models, cache=FALSE}
+for (fset_name in c("raw", "rolling", "all")) {
+
+  feats <- switch(fset_name,
+                  raw     = raw_features,
+                  rolling = rolling_features,
+                  all     = all_features)
+  feats <- feats[feats %in% names(df)]
+
+  cols_needed <- c(feats, "spread")
+  tr <- train_df %>% select(all_of(cols_needed)) %>% drop_na()
+  te <- test_df  %>% select(all_of(cols_needed)) %>% drop_na()
+
+  X_tr <- as.matrix(tr[, feats]);  y_tr <- tr$spread
+  X_te <- as.matrix(te[, feats]);  y_te <- te$spread
+
+  cat(sprintf("\n--- Spread | %s (%d feats | train=%d test=%d) ---\n",
+              fset_name, length(feats), nrow(tr), nrow(te)))
+
+  lm_form <- as.formula(paste("spread ~", paste(feats, collapse = " + ")))
+
+  # ── M1: Linear Regression ────────────────────────────────────────────────
+  lm_fit  <- lm(lm_form, data = tr)
+  r <- tibble(target = "spread", model = "LinearRegression",
+              feature_set = fset_name,
+              train_MAE = mae(y_tr, predict(lm_fit, tr)),
+              test_MAE  = mae(y_te, predict(lm_fit, te)))
+  results <- bind_rows(results, r)
+  if (fset_name == "all") model_store$spread_lm <- lm_fit
+  cat(sprintf("  OLS          | Train MAE: %.3f | Test MAE: %.3f\n",
+              r$train_MAE, r$test_MAE))
+
+  # ── M2: Lasso ─────────────────────────────────────────────────────────────
+  cv_l   <- cv.glmnet(X_tr, y_tr, alpha = 1, nfolds = 5)
+  lfit   <- glmnet(X_tr, y_tr, alpha = 1, lambda = cv_l$lambda.min)
+  r <- tibble(target = "spread", model = "Lasso",
+              feature_set = fset_name,
+              train_MAE = mae(y_tr, predict(lfit, X_tr)[,1]),
+              test_MAE  = mae(y_te, predict(lfit, X_te)[,1]))
+  results <- bind_rows(results, r)
+  if (fset_name == "all") { model_store$spread_lasso <- lfit
+                             model_store$spread_lasso_lambda <- cv_l$lambda.min }
+  cat(sprintf("  Lasso        | Train MAE: %.3f | Test MAE: %.3f  [λ=%.5f]\n",
+              r$train_MAE, r$test_MAE, cv_l$lambda.min))
+
+  # ── M3: Ridge ─────────────────────────────────────────────────────────────
+  cv_r   <- cv.glmnet(X_tr, y_tr, alpha = 0, nfolds = 5)
+  rfit   <- glmnet(X_tr, y_tr, alpha = 0, lambda = cv_r$lambda.min)
+  r <- tibble(target = "spread", model = "Ridge",
+              feature_set = fset_name,
+              train_MAE = mae(y_tr, predict(rfit, X_tr)[,1]),
+              test_MAE  = mae(y_te, predict(rfit, X_te)[,1]))
+  results <- bind_rows(results, r)
+  if (fset_name == "all") { model_store$spread_ridge <- rfit
+                             model_store$spread_ridge_lambda <- cv_r$lambda.min }
+  cat(sprintf("  Ridge        | Train MAE: %.3f | Test MAE: %.3f  [λ=%.5f]\n",
+              r$train_MAE, r$test_MAE, cv_r$lambda.min))
+
+  # ── M4: Regression Tree ───────────────────────────────────────────────────
+  tfit  <- rpart(lm_form, data = tr,
+                 control = rpart.control(cp = 0.001, maxdepth = 6))
+  tfit  <- prune(tfit, cp = tfit$cptable[which.min(tfit$cptable[,"xerror"]), "CP"])
+  r <- tibble(target = "spread", model = "RegressionTree",
+              feature_set = fset_name,
+              train_MAE = mae(y_tr, predict(tfit, tr)),
+              test_MAE  = mae(y_te, predict(tfit, te)))
+  results <- bind_rows(results, r)
+  if (fset_name == "all") model_store$spread_tree <- tfit
+  cat(sprintf("  Tree         | Train MAE: %.3f | Test MAE: %.3f\n",
+              r$train_MAE, r$test_MAE))
+
+  # ── M5: Random Forest ─────────────────────────────────────────────────────
+  rffit <- randomForest(X_tr, y_tr, ntree = 300,
+                        mtry = max(1, floor(sqrt(length(feats)))),
+                        importance = TRUE)
+  r <- tibble(target = "spread", model = "RandomForest",
+              feature_set = fset_name,
+              train_MAE = mae(y_tr, predict(rffit, X_tr)),
+              test_MAE  = mae(y_te, predict(rffit, X_te)))
+  results <- bind_rows(results, r)
+  if (fset_name == "all") model_store$spread_rf <- rffit
+  cat(sprintf("  RandomForest | Train MAE: %.3f | Test MAE: %.3f  [mtry=%d]\n",
+              r$train_MAE, r$test_MAE, max(1, floor(sqrt(length(feats))))))
+
+  # ── M6: XGBoost ───────────────────────────────────────────────────────────
+  dtrain <- xgb.DMatrix(X_tr, label = y_tr)
+  dtest  <- xgb.DMatrix(X_te, label = y_te)
+  xgb_p  <- list(objective="reg:squarederror", eta=0.05, max_depth=4,
+                 subsample=0.8, colsample_bytree=0.8, min_child_weight=5)
+  xgb_cv <- xgb.cv(params=xgb_p, data=dtrain, nrounds=500, nfold=5,
+                   early_stopping_rounds=30, verbose=FALSE, metrics="mae")
+  # Safe best_iteration: use stored value if valid, else find row with min test-mae
+  nr <- xgb_cv$best_iteration
+  if (is.null(nr) || length(nr) == 0 || nr == 0) {
+    nr <- which.min(xgb_cv$evaluation_log$test_mae_mean)
+  }
+  nr <- max(1L, as.integer(nr))   # guarantee positive integer
+  xfit   <- xgb.train(params=xgb_p, data=dtrain, nrounds=nr, verbose=0)
+  r <- tibble(target = "spread", model = "XGBoost",
+              feature_set = fset_name,
+              train_MAE = mae(y_tr, predict(xfit, dtrain)),
+              test_MAE  = mae(y_te, predict(xfit, dtest)))
+  results <- bind_rows(results, r)
+  if (fset_name == "all") {
+    model_store$spread_xgb        <- xfit
+    model_store$spread_xgb_feats  <- feats
+    model_store$spread_xgb_nr     <- nr
+    model_store$spread_xgb_params <- xgb_p
+  }
+  cat(sprintf("  XGBoost      | Train MAE: %.3f | Test MAE: %.3f  [nrounds=%d]\n",
+              r$train_MAE, r$test_MAE, nr))
+
+  # ── M7: Neural Network ────────────────────────────────────────────────────
+  sc      <- list(mean = colMeans(X_tr), sd = apply(X_tr, 2, sd))
+  sc$sd[sc$sd == 0] <- 1
+  Xs_tr   <- scale(X_tr, center = sc$mean, scale = sc$sd)
+  Xs_te   <- scale(X_te, center = sc$mean, scale = sc$sd)
+  ym      <- mean(y_tr); ys <- sd(y_tr)
+  nnfit   <- nnet(Xs_tr, (y_tr - ym)/ys, size=10, linout=TRUE,
+                  decay=0.01, maxit=500, trace=FALSE)
+  r <- tibble(target = "spread", model = "NeuralNetwork",
+              feature_set = fset_name,
+              train_MAE = mae(y_tr, predict(nnfit, Xs_tr)*ys + ym),
+              test_MAE  = mae(y_te, predict(nnfit, Xs_te)*ys + ym))
+  results <- bind_rows(results, r)
+  if (fset_name == "all") {
+    model_store$spread_nn        <- nnfit
+    model_store$spread_nn_sc     <- sc
+    model_store$spread_nn_ym     <- ym
+    model_store$spread_nn_ys     <- ys
+    model_store$spread_nn_feats  <- feats   # exact columns NN was trained on
+  }
+  cat(sprintf("  NeuralNet    | Train MAE: %.3f | Test MAE: %.3f  [size=10, decay=0.01]\n",
+              r$train_MAE, r$test_MAE))
+}
+```
+
+## 5b. Spread Results Table
+
+```{r spread-results-table}
+results %>%
+  filter(target == "spread") %>%
+  arrange(test_MAE) %>%
+  kable(digits = 3, caption = "Spread Model Comparison (sorted by Test MAE)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(1, bold = TRUE, background = "#d4edda")
+```
+
+## 5c. Spread Feature Importance & Tree Visualisation
+
+```{r spread-plots, fig.height=5}
+# Random Forest importance
+imp <- importance(model_store$spread_rf, type = 1)
+imp_df <- data.frame(Feature = rownames(imp), IncMSE = imp[,1]) %>%
+  arrange(desc(IncMSE)) %>% head(20)
+
+barplot(imp_df$IncMSE, names.arg = imp_df$Feature,
+        las = 2, col = "steelblue", cex.names = 0.65,
+        main = "Spread — Random Forest: Top 20 Features (%IncMSE)",
+        ylab = "%IncMSE")
+```
+
+```{r spread-tree-plot, fig.height=6}
+rpart.plot(model_store$spread_tree,
+           main = "Spread — Pruned Regression Tree",
+           type = 4, extra = 101, cex = 0.55)
+```
+
+```{r spread-lasso-coefs}
+# Non-zero Lasso coefficients
+coef_mat  <- coef(model_store$spread_lasso)
+coef_df   <- data.frame(
+  Feature     = rownames(coef_mat),
+  Coefficient = as.numeric(coef_mat)
+) %>%
+  filter(Coefficient != 0, Feature != "(Intercept)") %>%
+  arrange(desc(abs(Coefficient)))
+
+kable(coef_df, digits = 4,
+      caption = paste0("Spread Lasso: Non-Zero Coefficients  [λ = ",
+                       round(model_store$spread_lasso_lambda, 5), "]")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+---
+
+# 6. TOTAL Models
+
+> **Target:** `total = home_teamScore + away_teamScore`  
+> A slight right skew motivates comparison of models on raw vs. log scale.
+
+## 6a. Model Loop
+
+```{r total-models, cache=FALSE}
+for (fset_name in c("raw", "rolling", "all")) {
+
+  feats <- switch(fset_name,
+                  raw     = raw_features,
+                  rolling = rolling_features,
+                  all     = all_features)
+  feats <- feats[feats %in% names(df)]
+
+  cols_needed <- c(feats, "total")
+  tr <- train_df %>% select(all_of(cols_needed)) %>% drop_na()
+  te <- test_df  %>% select(all_of(cols_needed)) %>% drop_na()
+
+  X_tr <- as.matrix(tr[, feats]);  y_tr <- tr$total
+  X_te <- as.matrix(te[, feats]);  y_te <- te$total
+
+  cat(sprintf("\n--- Total | %s (%d feats | train=%d test=%d) ---\n",
+              fset_name, length(feats), nrow(tr), nrow(te)))
+
+  lm_form <- as.formula(paste("total ~", paste(feats, collapse = " + ")))
+
+  # ── M1: Linear Regression ────────────────────────────────────────────────
+  lm_fit <- lm(lm_form, data = tr)
+  r <- tibble(target="total", model="LinearRegression",
+              feature_set=fset_name,
+              train_MAE=mae(y_tr, predict(lm_fit, tr)),
+              test_MAE =mae(y_te, predict(lm_fit, te)))
+  results <- bind_rows(results, r)
+  if (fset_name=="all") model_store$total_lm <- lm_fit
+  cat(sprintf("  OLS          | Train MAE: %.3f | Test MAE: %.3f\n",
+              r$train_MAE, r$test_MAE))
+
+  # ── M2: Lasso ─────────────────────────────────────────────────────────────
+  cv_l  <- cv.glmnet(X_tr, y_tr, alpha=1, nfolds=5)
+  lfit  <- glmnet(X_tr, y_tr, alpha=1, lambda=cv_l$lambda.min)
+  r <- tibble(target="total", model="Lasso", feature_set=fset_name,
+              train_MAE=mae(y_tr, predict(lfit, X_tr)[,1]),
+              test_MAE =mae(y_te, predict(lfit, X_te)[,1]))
+  results <- bind_rows(results, r)
+  if (fset_name=="all") { model_store$total_lasso <- lfit
+                           model_store$total_lasso_lambda <- cv_l$lambda.min }
+  cat(sprintf("  Lasso        | Train MAE: %.3f | Test MAE: %.3f  [λ=%.5f]\n",
+              r$train_MAE, r$test_MAE, cv_l$lambda.min))
+
+  # ── M3: Ridge ─────────────────────────────────────────────────────────────
+  cv_r  <- cv.glmnet(X_tr, y_tr, alpha=0, nfolds=5)
+  rfit  <- glmnet(X_tr, y_tr, alpha=0, lambda=cv_r$lambda.min)
+  r <- tibble(target="total", model="Ridge", feature_set=fset_name,
+              train_MAE=mae(y_tr, predict(rfit, X_tr)[,1]),
+              test_MAE =mae(y_te, predict(rfit, X_te)[,1]))
+  results <- bind_rows(results, r)
+  if (fset_name=="all") { model_store$total_ridge <- rfit
+                           model_store$total_ridge_lambda <- cv_r$lambda.min }
+  cat(sprintf("  Ridge        | Train MAE: %.3f | Test MAE: %.3f  [λ=%.5f]\n",
+              r$train_MAE, r$test_MAE, cv_r$lambda.min))
+
+  # ── M4: Regression Tree ───────────────────────────────────────────────────
+  tfit <- rpart(lm_form, data=tr,
+                control=rpart.control(cp=0.001, maxdepth=6))
+  tfit <- prune(tfit, cp=tfit$cptable[which.min(tfit$cptable[,"xerror"]), "CP"])
+  r <- tibble(target="total", model="RegressionTree", feature_set=fset_name,
+              train_MAE=mae(y_tr, predict(tfit, tr)),
+              test_MAE =mae(y_te, predict(tfit, te)))
+  results <- bind_rows(results, r)
+  if (fset_name=="all") model_store$total_tree <- tfit
+  cat(sprintf("  Tree         | Train MAE: %.3f | Test MAE: %.3f\n",
+              r$train_MAE, r$test_MAE))
+
+  # ── M5: Random Forest ─────────────────────────────────────────────────────
+  rffit <- randomForest(X_tr, y_tr, ntree=300,
+                        mtry=max(1, floor(sqrt(length(feats)))),
+                        importance=TRUE)
+  r <- tibble(target="total", model="RandomForest", feature_set=fset_name,
+              train_MAE=mae(y_tr, predict(rffit, X_tr)),
+              test_MAE =mae(y_te, predict(rffit, X_te)))
+  results <- bind_rows(results, r)
+  if (fset_name=="all") model_store$total_rf <- rffit
+  cat(sprintf("  RandomForest | Train MAE: %.3f | Test MAE: %.3f  [mtry=%d]\n",
+              r$train_MAE, r$test_MAE, max(1, floor(sqrt(length(feats))))))
+
+  # ── M6: XGBoost ───────────────────────────────────────────────────────────
+  dtrain <- xgb.DMatrix(X_tr, label=y_tr)
+  dtest  <- xgb.DMatrix(X_te, label=y_te)
+  xgb_p  <- list(objective="reg:squarederror", eta=0.05, max_depth=4,
+                 subsample=0.8, colsample_bytree=0.8, min_child_weight=5)
+  xgb_cv <- xgb.cv(params=xgb_p, data=dtrain, nrounds=500, nfold=5,
+                   early_stopping_rounds=30, verbose=FALSE, metrics="mae")
+  nr <- xgb_cv$best_iteration
+  if (is.null(nr) || length(nr) == 0 || nr == 0) {
+    nr <- which.min(xgb_cv$evaluation_log$test_mae_mean)
+  }
+  nr <- max(1L, as.integer(nr))
+  xfit   <- xgb.train(params=xgb_p, data=dtrain, nrounds=nr, verbose=0)
+  r <- tibble(target="total", model="XGBoost", feature_set=fset_name,
+              train_MAE=mae(y_tr, predict(xfit, dtrain)),
+              test_MAE =mae(y_te, predict(xfit, dtest)))
+  results <- bind_rows(results, r)
+  if (fset_name=="all") {
+    model_store$total_xgb        <- xfit
+    model_store$total_xgb_feats  <- feats
+    model_store$total_xgb_nr     <- nr
+    model_store$total_xgb_params <- xgb_p
+  }
+  cat(sprintf("  XGBoost      | Train MAE: %.3f | Test MAE: %.3f  [nrounds=%d]\n",
+              r$train_MAE, r$test_MAE, nr))
+
+  # ── M7: Neural Network ────────────────────────────────────────────────────
+  sc    <- list(mean=colMeans(X_tr), sd=apply(X_tr,2,sd))
+  sc$sd[sc$sd==0] <- 1
+  Xs_tr <- scale(X_tr, center=sc$mean, scale=sc$sd)
+  Xs_te <- scale(X_te, center=sc$mean, scale=sc$sd)
+  ym    <- mean(y_tr); ys <- sd(y_tr)
+  nnfit <- nnet(Xs_tr, (y_tr-ym)/ys, size=10, linout=TRUE,
+                decay=0.01, maxit=500, trace=FALSE)
+  r <- tibble(target="total", model="NeuralNetwork", feature_set=fset_name,
+              train_MAE=mae(y_tr, predict(nnfit,Xs_tr)*ys+ym),
+              test_MAE =mae(y_te, predict(nnfit,Xs_te)*ys+ym))
+  results <- bind_rows(results, r)
+  if (fset_name=="all") {
+    model_store$total_nn        <- nnfit
+    model_store$total_nn_sc     <- sc
+    model_store$total_nn_ym     <- ym
+    model_store$total_nn_ys     <- ys
+    model_store$total_nn_feats  <- feats   # exact columns NN was trained on
+  }
+  cat(sprintf("  NeuralNet    | Train MAE: %.3f | Test MAE: %.3f  [size=10, decay=0.01]\n",
+              r$train_MAE, r$test_MAE))
+}
+```
+
+## 6b. Total Results Table
+
+```{r total-results-table}
+results %>%
+  filter(target == "total") %>%
+  arrange(test_MAE) %>%
+  kable(digits=3, caption="Total Model Comparison (sorted by Test MAE)") %>%
+  kable_styling(bootstrap_options=c("striped","hover","condensed")) %>%
+  row_spec(1, bold=TRUE, background="#d4edda")
+```
+
+## 6c. Total Feature Importance & Tree
+
+```{r total-plots, fig.height=5}
+imp <- importance(model_store$total_rf, type=1)
+imp_df <- data.frame(Feature=rownames(imp), IncMSE=imp[,1]) %>%
+  arrange(desc(IncMSE)) %>% head(20)
+barplot(imp_df$IncMSE, names.arg=imp_df$Feature,
+        las=2, col="darkorange", cex.names=0.65,
+        main="Total — Random Forest: Top 20 Features (%IncMSE)", ylab="%IncMSE")
+```
+
+```{r total-tree-plot, fig.height=6}
+rpart.plot(model_store$total_tree,
+           main="Total — Pruned Regression Tree",
+           type=4, extra=101, cex=0.55)
+```
+
+---
+
+# 7. OREB Models
+
+> **Target:** `OREB = home_reboundsOffensive + away_reboundsOffensive`  
+> May be right-skewed; rebounding-specific features are emphasised.
+
+## 7a. Model Loop
+
+```{r oreb-models, cache=FALSE}
+for (fset_name in c("raw", "rolling", "all")) {
+
+  feats <- switch(fset_name,
+                  raw     = oreb_extra_raw,
+                  rolling = oreb_extra_roll,
+                  all     = union(oreb_extra_raw, oreb_extra_roll))
+  feats <- feats[feats %in% names(df)]
+
+  cols_needed <- c(feats, "OREB")
+  tr <- train_df %>% select(all_of(cols_needed)) %>% drop_na()
+  te <- test_df  %>% select(all_of(cols_needed)) %>% drop_na()
+
+  X_tr <- as.matrix(tr[, feats]);  y_tr <- tr$OREB
+  X_te <- as.matrix(te[, feats]);  y_te <- te$OREB
+
+  cat(sprintf("\n--- OREB | %s (%d feats | train=%d test=%d) ---\n",
+              fset_name, length(feats), nrow(tr), nrow(te)))
+
+  lm_form <- as.formula(paste("OREB ~", paste(feats, collapse=" + ")))
+
+  # ── M1: Linear Regression ────────────────────────────────────────────────
+  lm_fit <- lm(lm_form, data=tr)
+  r <- tibble(target="OREB", model="LinearRegression", feature_set=fset_name,
+              train_MAE=mae(y_tr, predict(lm_fit,tr)),
+              test_MAE =mae(y_te, predict(lm_fit,te)))
+  results <- bind_rows(results, r)
+  if (fset_name=="all") model_store$OREB_lm <- lm_fit
+  cat(sprintf("  OLS          | Train MAE: %.3f | Test MAE: %.3f\n",
+              r$train_MAE, r$test_MAE))
+
+  # ── M2: Lasso ─────────────────────────────────────────────────────────────
+  cv_l  <- cv.glmnet(X_tr, y_tr, alpha=1, nfolds=5)
+  lfit  <- glmnet(X_tr, y_tr, alpha=1, lambda=cv_l$lambda.min)
+  r <- tibble(target="OREB", model="Lasso", feature_set=fset_name,
+              train_MAE=mae(y_tr, predict(lfit,X_tr)[,1]),
+              test_MAE =mae(y_te, predict(lfit,X_te)[,1]))
+  results <- bind_rows(results, r)
+  if (fset_name=="all") { model_store$OREB_lasso <- lfit
+                           model_store$OREB_lasso_lambda <- cv_l$lambda.min }
+  cat(sprintf("  Lasso        | Train MAE: %.3f | Test MAE: %.3f  [λ=%.5f]\n",
+              r$train_MAE, r$test_MAE, cv_l$lambda.min))
+
+  # ── M3: Ridge ─────────────────────────────────────────────────────────────
+  cv_r  <- cv.glmnet(X_tr, y_tr, alpha=0, nfolds=5)
+  rfit  <- glmnet(X_tr, y_tr, alpha=0, lambda=cv_r$lambda.min)
+  r <- tibble(target="OREB", model="Ridge", feature_set=fset_name,
+              train_MAE=mae(y_tr, predict(rfit,X_tr)[,1]),
+              test_MAE =mae(y_te, predict(rfit,X_te)[,1]))
+  results <- bind_rows(results, r)
+  if (fset_name=="all") { model_store$OREB_ridge <- rfit
+                           model_store$OREB_ridge_lambda <- cv_r$lambda.min }
+  cat(sprintf("  Ridge        | Train MAE: %.3f | Test MAE: %.3f  [λ=%.5f]\n",
+              r$train_MAE, r$test_MAE, cv_r$lambda.min))
+
+  # ── M4: Regression Tree ───────────────────────────────────────────────────
+  tfit <- rpart(lm_form, data=tr,
+                control=rpart.control(cp=0.001, maxdepth=6))
+  tfit <- prune(tfit, cp=tfit$cptable[which.min(tfit$cptable[,"xerror"]),"CP"])
+  r <- tibble(target="OREB", model="RegressionTree", feature_set=fset_name,
+              train_MAE=mae(y_tr, predict(tfit,tr)),
+              test_MAE =mae(y_te, predict(tfit,te)))
+  results <- bind_rows(results, r)
+  if (fset_name=="all") model_store$OREB_tree <- tfit
+  cat(sprintf("  Tree         | Train MAE: %.3f | Test MAE: %.3f\n",
+              r$train_MAE, r$test_MAE))
+
+  # ── M5: Random Forest ─────────────────────────────────────────────────────
+  rffit <- randomForest(X_tr, y_tr, ntree=300,
+                        mtry=max(1, floor(sqrt(length(feats)))),
+                        importance=TRUE)
+  r <- tibble(target="OREB", model="RandomForest", feature_set=fset_name,
+              train_MAE=mae(y_tr, predict(rffit,X_tr)),
+              test_MAE =mae(y_te, predict(rffit,X_te)))
+  results <- bind_rows(results, r)
+  if (fset_name=="all") model_store$OREB_rf <- rffit
+  cat(sprintf("  RandomForest | Train MAE: %.3f | Test MAE: %.3f  [mtry=%d]\n",
+              r$train_MAE, r$test_MAE, max(1, floor(sqrt(length(feats))))))
+
+  # ── M6: XGBoost ───────────────────────────────────────────────────────────
+  dtrain <- xgb.DMatrix(X_tr, label=y_tr)
+  dtest  <- xgb.DMatrix(X_te, label=y_te)
+  xgb_p  <- list(objective="reg:squarederror", eta=0.05, max_depth=4,
+                 subsample=0.8, colsample_bytree=0.8, min_child_weight=3)
+  xgb_cv <- xgb.cv(params=xgb_p, data=dtrain, nrounds=500, nfold=5,
+                   early_stopping_rounds=30, verbose=FALSE, metrics="mae")
+  nr <- xgb_cv$best_iteration
+  if (is.null(nr) || length(nr) == 0 || nr == 0) {
+    nr <- which.min(xgb_cv$evaluation_log$test_mae_mean)
+  }
+  nr <- max(1L, as.integer(nr))
+  xfit   <- xgb.train(params=xgb_p, data=dtrain, nrounds=nr, verbose=0)
+  r <- tibble(target="OREB", model="XGBoost", feature_set=fset_name,
+              train_MAE=mae(y_tr, predict(xfit,dtrain)),
+              test_MAE =mae(y_te, predict(xfit,dtest)))
+  results <- bind_rows(results, r)
+  if (fset_name=="all") {
+    model_store$OREB_xgb        <- xfit
+    model_store$OREB_xgb_feats  <- feats
+    model_store$OREB_xgb_nr     <- nr
+    model_store$OREB_xgb_params <- xgb_p
+  }
+  cat(sprintf("  XGBoost      | Train MAE: %.3f | Test MAE: %.3f  [nrounds=%d]\n",
+              r$train_MAE, r$test_MAE, nr))
+
+  # ── M7: Neural Network ────────────────────────────────────────────────────
+  sc    <- list(mean=colMeans(X_tr), sd=apply(X_tr,2,sd))
+  sc$sd[sc$sd==0] <- 1
+  Xs_tr <- scale(X_tr, center=sc$mean, scale=sc$sd)
+  Xs_te <- scale(X_te, center=sc$mean, scale=sc$sd)
+  ym    <- mean(y_tr); ys <- sd(y_tr)
+  nnfit <- nnet(Xs_tr, (y_tr-ym)/ys, size=8, linout=TRUE,
+                decay=0.01, maxit=500, trace=FALSE)
+  r <- tibble(target="OREB", model="NeuralNetwork", feature_set=fset_name,
+              train_MAE=mae(y_tr, predict(nnfit,Xs_tr)*ys+ym),
+              test_MAE =mae(y_te, predict(nnfit,Xs_te)*ys+ym))
+  results <- bind_rows(results, r)
+  if (fset_name=="all") {
+    model_store$OREB_nn        <- nnfit
+    model_store$OREB_nn_sc     <- sc
+    model_store$OREB_nn_ym     <- ym
+    model_store$OREB_nn_ys     <- ys
+    model_store$OREB_nn_feats  <- feats   # exact columns NN was trained on
+  }
+  cat(sprintf("  NeuralNet    | Train MAE: %.3f | Test MAE: %.3f  [size=8, decay=0.01]\n",
+              r$train_MAE, r$test_MAE))
+}
+```
+
+## 7b. OREB Results Table
+
+```{r oreb-results-table}
+results %>%
+  filter(target == "OREB") %>%
+  arrange(test_MAE) %>%
+  kable(digits=3, caption="OREB Model Comparison (sorted by Test MAE)") %>%
+  kable_styling(bootstrap_options=c("striped","hover","condensed")) %>%
+  row_spec(1, bold=TRUE, background="#d4edda")
+```
+
+## 7c. OREB Feature Importance & Tree
+
+```{r oreb-plots, fig.height=5}
+imp <- importance(model_store$OREB_rf, type=1)
+imp_df <- data.frame(Feature=rownames(imp), IncMSE=imp[,1]) %>%
+  arrange(desc(IncMSE)) %>% head(20)
+barplot(imp_df$IncMSE, names.arg=imp_df$Feature,
+        las=2, col="forestgreen", cex.names=0.65,
+        main="OREB — Random Forest: Top 20 Features (%IncMSE)", ylab="%IncMSE")
+```
+
+```{r oreb-tree-plot, fig.height=6}
+rpart.plot(model_store$OREB_tree,
+           main="OREB — Pruned Regression Tree",
+           type=4, extra=101, cex=0.55)
+```
+
+---
+
+# 8. Overall Comparison & Best Model Selection
+
+```{r full-summary-table}
+results %>%
+  arrange(target, test_MAE) %>%
+  kable(digits=3, caption="All Models — Full MAE Summary") %>%
+  kable_styling(bootstrap_options=c("striped","hover","condensed","responsive"),
+                full_width=FALSE) %>%
+  pack_rows("OREB",   1,  21) %>%
+  pack_rows("Spread", 22, 42) %>%
+  pack_rows("Total",  43, 63)
+```
+
+```{r best-per-target}
+best_models <- results %>%
+  group_by(target) %>%
+  slice_min(test_MAE, n=1) %>%
+  ungroup()
+
+kable(best_models, digits=3,
+      caption="Best Model Per Target Variable (lowest Test MAE)") %>%
+  kable_styling(bootstrap_options=c("striped","hover"),
+                full_width=FALSE) %>%
+  row_spec(1:3, bold=TRUE, background="#cce5ff")
+```
+
+```{r save-results}
+write.csv(results, "model_results_summary.csv", row.names=FALSE)
+cat("Saved: model_results_summary.csv\n")
+```
+
+---
+
+# 9. Prediction Pipeline for March 14 – April 12
+
+## 9a. Rolling-Feature Builder (per team, per game date)
+
+```{r rolling-builder-fn}
+compute_rolling_for_team <- function(team_name, as_of_date, df_hist, k=5) {
+  hist <- df_hist %>%
+    filter((Home == team_name | Away == team_name),
+           gameDate < as_of_date) %>%
+    arrange(gameDate) %>%
+    tail(k + 10)
+
+  pts   <- ifelse(hist$Home==team_name, hist$home_teamScore,        hist$away_teamScore)
+  oreb  <- ifelse(hist$Home==team_name, hist$home_reboundsOffensive, hist$away_reboundsOffensive)
+  dreb  <- ifelse(hist$Home==team_name, hist$home_reboundsDefensive, hist$away_reboundsDefensive)
+  efg   <- ifelse(hist$Home==team_name, hist$home_eFGpct,            hist$away_eFGpct)
+  tov   <- ifelse(hist$Home==team_name, hist$home_turnovers,         hist$away_turnovers)
+  obr   <- ifelse(hist$Home==team_name, hist$home_OBRpct,            hist$away_OBRpct)
+  fgpct <- ifelse(hist$Home==team_name, hist$home_fieldGoalsPercentage, hist$away_fieldGoalsPercentage)
+
+  sm <- function(v, n) if (length(v) >= n) mean(tail(v,n)) else mean(v)
+  lg <- function(v)    if (length(v) >= 1) tail(v,1)       else NA_real_
+
+  list(
+    roll_pts5    = sm(pts,  5),  roll_oreb5   = sm(oreb, 5),
+    roll_dreb5   = sm(dreb, 5),  roll_efg5    = sm(efg,  5),
+    roll_tov5    = sm(tov,  5),  roll_obrpct5 = sm(obr,  5),
+    roll_fgpct5  = sm(fgpct,5),
+    roll_pts10   = sm(pts,  10), roll_oreb10  = sm(oreb, 10),
+    lag_pts      = lg(pts),      lag_oreb     = lg(oreb),
+    lag_tov      = lg(tov)
+  )
+}
+
+# ── Single-row feature builder ───────────────────────────────────────────────
+# Builds ONE tibble row with EVERY column in rolling_features + oreb_extra_roll.
+# Used identically by generate_future_predictions() and the 9d validation block
+# so both always produce exactly the same column set.
+build_rolling_row <- function(gd, home, away, hwp, awp, df_hist) {
+  h <- compute_rolling_for_team(home, gd, df_hist)
+  a <- compute_rolling_for_team(away, gd, df_hist)
+  tibble(
+    gameDate          = gd,
+    Home              = home,
+    Away              = away,
+    # per-team rolling stats
+    home_roll_pts5    = h$roll_pts5,    away_roll_pts5    = a$roll_pts5,
+    home_roll_oreb5   = h$roll_oreb5,   away_roll_oreb5   = a$roll_oreb5,
+    home_roll_efg5    = h$roll_efg5,    away_roll_efg5    = a$roll_efg5,
+    home_roll_tov5    = h$roll_tov5,    away_roll_tov5    = a$roll_tov5,
+    home_roll_fgpct5  = h$roll_fgpct5,  away_roll_fgpct5  = a$roll_fgpct5,
+    home_roll_dreb5   = h$roll_dreb5,   away_roll_dreb5   = a$roll_dreb5,
+    home_roll_obrpct5 = h$roll_obrpct5, away_roll_obrpct5 = a$roll_obrpct5,
+    home_roll_pts10   = h$roll_pts10,   away_roll_pts10   = a$roll_pts10,
+    home_roll_oreb10  = h$roll_oreb10,  away_roll_oreb10  = a$roll_oreb10,
+    home_lag_pts      = h$lag_pts,      away_lag_pts      = a$lag_pts,
+    home_lag_oreb     = h$lag_oreb,     away_lag_oreb     = a$lag_oreb,
+    home_lag_tov      = h$lag_tov,      away_lag_tov      = a$lag_tov,
+    # differentials & sums — ALL entries from rolling_features
+    diff_roll_pts5    = h$roll_pts5   - a$roll_pts5,
+    diff_roll_oreb5   = h$roll_oreb5  - a$roll_oreb5,
+    diff_roll_efg5    = h$roll_efg5   - a$roll_efg5,
+    diff_roll_tov5    = h$roll_tov5   - a$roll_tov5,
+    sum_roll_pts5     = h$roll_pts5   + a$roll_pts5,   # was missing in old code
+    sum_roll_oreb5    = h$roll_oreb5  + a$roll_oreb5,
+    diff_roll_pts10   = h$roll_pts10  - a$roll_pts10,
+    sum_roll_pts10    = h$roll_pts10  + a$roll_pts10,  # was missing in old code
+    # win pct features
+    home_winPct       = hwp,
+    away_winPct       = awp,
+    diff_winPct       = hwp - awp,
+    sum_winPct        = hwp + awp,
+    ratio_winPct      = (hwp + 0.01) / (awp + 0.01)
+  )
+}
+```
+
+## 9b. Train Rolling-Only Pipeline RF Models
+
+```{r pipeline-rf-retrain}
+# These RFs are trained on rolling features only — the only features available
+# before a future game. They must be trained BEFORE generate_future_predictions()
+# is defined so the global objects exist when that function is called.
+
+roll_feats_tr      <- rolling_features[rolling_features %in% names(train_df)]
+oreb_roll_feats_tr <- oreb_extra_roll[oreb_extra_roll   %in% names(train_df)]
+
+tr_roll_spread <- train_df %>%
+  select(all_of(c(roll_feats_tr, "spread"))) %>% drop_na()
+tr_roll_total  <- train_df %>%
+  select(all_of(c(roll_feats_tr, "total")))  %>% drop_na()
+tr_roll_oreb   <- train_df %>%
+  select(all_of(c(oreb_roll_feats_tr, "OREB"))) %>% drop_na()
+
+rf_pipe_spread <- randomForest(
+  x = tr_roll_spread[, roll_feats_tr, drop = FALSE],
+  y = tr_roll_spread$spread,
+  ntree = 300, mtry = max(1, floor(sqrt(length(roll_feats_tr)))), importance = TRUE
+)
+rf_pipe_total  <- randomForest(
+  x = tr_roll_total[, roll_feats_tr, drop = FALSE],
+  y = tr_roll_total$total,
+  ntree = 300, mtry = max(1, floor(sqrt(length(roll_feats_tr)))), importance = TRUE
+)
+rf_pipe_oreb   <- randomForest(
+  x = tr_roll_oreb[, oreb_roll_feats_tr, drop = FALSE],
+  y = tr_roll_oreb$OREB,
+  ntree = 300, mtry = max(1, floor(sqrt(length(oreb_roll_feats_tr)))), importance = TRUE
+)
+
+cat("Pipeline RF models ready.\n")
+cat(sprintf("  Spread: %d features, %d rows\n", length(roll_feats_tr),      nrow(tr_roll_spread)))
+cat(sprintf("  Total:  %d features, %d rows\n", length(roll_feats_tr),      nrow(tr_roll_total)))
+cat(sprintf("  OREB:   %d features, %d rows\n", length(oreb_roll_feats_tr), nrow(tr_roll_oreb)))
+```
+
+## 9c. Generate Predictions from a Schedule CSV
+
+```{r predict-fn}
+# ── Prediction dispatcher ────────────────────────────────────────────────────
+predict_from_store <- function(nd, model_name, target_name,
+                               feat_override = NULL) {
+
+  all_f  <- all_features
+  oreb_f <- union(oreb_extra_raw, oreb_extra_roll)
+  feats  <- if (!is.null(feat_override)) feat_override else
+            if (target_name == "OREB") oreb_f else all_f
+  feats  <- feats[feats %in% names(nd)]
+
+  key <- switch(model_name,
+                LinearRegression = paste0(target_name, "_lm"),
+                Lasso            = paste0(target_name, "_lasso"),
+                Ridge            = paste0(target_name, "_ridge"),
+                RegressionTree   = paste0(target_name, "_tree"),
+                RandomForest     = paste0(target_name, "_rf"),
+                XGBoost          = paste0(target_name, "_xgb"),
+                NeuralNetwork    = paste0(target_name, "_nn"))
+
+  nd_c <- nd %>% select(all_of(feats)) %>% drop_na()
+
+  if (model_name == "XGBoost") {
+    # Use the exact feature set the XGBoost model was trained on
+    fu <- model_store[[paste0(key, "_feats")]]
+    fu <- fu[fu %in% names(nd_c)]
+    predict(model_store[[key]], xgb.DMatrix(as.matrix(nd_c[, fu])))
+
+  } else if (model_name == "RandomForest") {
+    # RF will error if columns mismatch — intersect with training columns
+    rf_vars <- model_store[[key]]$forest$independent.variable.names
+    if (!is.null(rf_vars)) {
+      fu <- rf_vars[rf_vars %in% names(nd_c)]
+    } else {
+      fu <- feats
+    }
+    predict(model_store[[key]], as.matrix(nd_c[, fu]))
+
+  } else if (model_name == "NeuralNetwork") {
+    sc <- model_store[[paste0(key, "_sc")]]
+    ym <- model_store[[paste0(key, "_ym")]]
+    ys <- model_store[[paste0(key, "_ys")]]
+    # Use ONLY the features the NN was trained on (sc$mean has one entry per
+    # training column — mismatches cause the scale() length error)
+    nn_feats <- model_store[[paste0(key, "_feats")]]
+    nn_feats <- nn_feats[nn_feats %in% names(nd_c)]
+    # Re-subset nd_c and sc to the common columns
+    sc_mean  <- sc$mean[nn_feats]
+    sc_sd    <- sc$sd[nn_feats]
+    Xs <- scale(as.matrix(nd_c[, nn_feats]),
+                center = sc_mean, scale = sc_sd)
+    predict(model_store[[key]], Xs) * ys + ym
+
+  } else {
+    # lm / glmnet / rpart — predict() handles column matching internally
+    predict(model_store[[key]], nd_c)
+  }
+}
+
+# ── Main prediction function ─────────────────────────────────────────────────
+# Uses the dedicated rolling-only RF models (rf_pipe_*) trained in section 9a.
+# These are guaranteed to match the feature set available for future games.
+generate_future_predictions <- function(schedule_path, df_hist) {
+  fg <- read.csv(schedule_path, stringsAsFactors = FALSE)
+  fg$gameDate <- as.Date(fg$gameDate)
+
+  preds <- map_dfr(seq_len(nrow(fg)), function(i) {
+    build_rolling_row(fg$gameDate[i], fg$Home[i], fg$Away[i],
+                      fg$home_winPct[i], fg$away_winPct[i], df_hist)
+  })
+
+  # Use the column lists saved at retrain time
+  roll_use      <- roll_feats_tr[roll_feats_tr           %in% names(preds)]
+  oreb_roll_use <- oreb_roll_feats_tr[oreb_roll_feats_tr %in% names(preds)]
+
+  # Drop rows with NA, preserving original row index for assignment
+  preds_spread <- preds %>% mutate(.rid = row_number()) %>% drop_na(any_of(roll_use))
+  preds_total  <- preds %>% mutate(.rid = row_number()) %>% drop_na(any_of(roll_use))
+  preds_oreb   <- preds %>% mutate(.rid = row_number()) %>% drop_na(any_of(oreb_roll_use))
+
+  preds$pred_spread <- NA_real_
+  preds$pred_total  <- NA_real_
+  preds$pred_OREB   <- NA_real_
+
+  # Reference global RF objects directly (defined in pipeline-rf-retrain chunk)
+  preds$pred_spread[preds_spread$.rid] <-
+    predict(rf_pipe_spread, newdata = preds_spread[, roll_use,      drop = FALSE])
+  preds$pred_total[preds_total$.rid] <-
+    predict(rf_pipe_total,  newdata = preds_total[,  roll_use,      drop = FALSE])
+  preds$pred_OREB[preds_oreb$.rid] <-
+    predict(rf_pipe_oreb,   newdata = preds_oreb[,   oreb_roll_use, drop = FALSE])
+
+  preds %>% select(gameDate, Home, Away, pred_spread, pred_total, pred_OREB)
+}
+```
+
+## 9d. Usage Instructions
+
+```{r usage-note, eval=FALSE}
+# ── STEP 1: Create future_games.csv with these columns:
+#   gameDate  | Home | Away | home_winPct | away_winPct
+#
+# ── STEP 2: Run:
+future_preds <- generate_future_predictions("future_games.csv", df_raw)
+print(future_preds)
+#
+# ── STEP 3: Fill the Predictions CSV:
+write.csv(future_preds, "Predictions.csv", row.names = FALSE)
+```
+
+## 9e. Pipeline Validation on Held-Out Test Games
+
+```{r pipeline-validation}
+# Build rolling feature rows for 40 held-out test games
+sample_test <- test_df %>%
+  select(gameDate, Home, Away, home_winPct, away_winPct,
+         spread, total, OREB) %>%
+  head(40)
+
+demo_rows <- map_dfr(seq_len(nrow(sample_test)), function(i) {
+  build_rolling_row(sample_test$gameDate[i], sample_test$Home[i],
+                    sample_test$Away[i],
+                    sample_test$home_winPct[i], sample_test$away_winPct[i],
+                    df_raw)
+})
+
+# Use the global column vectors defined in the pipeline-rf-retrain chunk
+spread_use <- roll_feats_tr[roll_feats_tr           %in% names(demo_rows)]
+total_use  <- roll_feats_tr[roll_feats_tr           %in% names(demo_rows)]
+oreb_use   <- oreb_roll_feats_tr[oreb_roll_feats_tr %in% names(demo_rows)]
+
+# Diagnostic: report anything the RF expects that demo_rows doesn't have
+missing_spread <- setdiff(roll_feats_tr,      names(demo_rows))
+missing_oreb   <- setdiff(oreb_roll_feats_tr, names(demo_rows))
+if (length(missing_spread) > 0)
+  cat("Missing for spread/total RF:", paste(missing_spread, collapse = ", "), "\n")
+if (length(missing_oreb) > 0)
+  cat("Missing for OREB RF:",         paste(missing_oreb,   collapse = ", "), "\n")
+
+# Complete-case subsets — keep as data.frame (not matrix) for named matching
+demo_spread <- demo_rows %>% mutate(row_id = row_number()) %>% drop_na(any_of(spread_use))
+demo_total  <- demo_rows %>% mutate(row_id = row_number()) %>% drop_na(any_of(total_use))
+demo_oreb   <- demo_rows %>% mutate(row_id = row_number()) %>% drop_na(any_of(oreb_use))
+
+demo_rows$pred_spread <- NA_real_
+demo_rows$pred_total  <- NA_real_
+demo_rows$pred_OREB   <- NA_real_
+
+# Pass data.frame so predict.randomForest() matches columns by name
+demo_rows$pred_spread[demo_spread$row_id] <-
+  predict(rf_pipe_spread, newdata = demo_spread[, spread_use, drop = FALSE])
+demo_rows$pred_total[demo_total$row_id]   <-
+  predict(rf_pipe_total,  newdata = demo_total[,  total_use,  drop = FALSE])
+demo_rows$pred_OREB[demo_oreb$row_id]     <-
+  predict(rf_pipe_oreb,   newdata = demo_oreb[,   oreb_use,   drop = FALSE])
+
+demo_rows$actual_spread <- sample_test$spread
+demo_rows$actual_total  <- sample_test$total
+demo_rows$actual_OREB   <- sample_test$OREB
+
+val_mae <- tibble(
+  Target             = c("Spread", "Total", "OREB"),
+  Rolling_Pipeline_MAE = c(
+    mae(demo_rows$actual_spread, demo_rows$pred_spread),
+    mae(demo_rows$actual_total,  demo_rows$pred_total),
+    mae(demo_rows$actual_OREB,   demo_rows$pred_OREB)
+  ),
+  N_games = c(
+    sum(!is.na(demo_rows$pred_spread)),
+    sum(!is.na(demo_rows$pred_total)),
+    sum(!is.na(demo_rows$pred_OREB))
+  )
+)
+
+kable(val_mae, digits = 3,
+      caption = "Rolling Pipeline Validation MAE (up to 40 test games, rolling-only RF)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r pipeline-scatter, fig.height=4}
+# Filter to rows where predictions exist
+demo_plot <- demo_rows %>% filter(!is.na(pred_spread), !is.na(pred_total), !is.na(pred_OREB))
+
+par(mfrow = c(1, 3))
+plot(demo_plot$actual_spread, demo_plot$pred_spread,
+     xlab = "Actual", ylab = "Predicted", main = "Spread (Rolling RF)",
+     pch = 16, col = "steelblue")
+abline(0, 1, col = "red", lwd = 2)
+
+plot(demo_plot$actual_total, demo_plot$pred_total,
+     xlab = "Actual", ylab = "Predicted", main = "Total (Rolling RF)",
+     pch = 16, col = "darkorange")
+abline(0, 1, col = "red", lwd = 2)
+
+plot(demo_plot$actual_OREB, demo_plot$pred_OREB,
+     xlab = "Actual", ylab = "Predicted", main = "OREB (Rolling RF)",
+     pch = 16, col = "forestgreen")
+abline(0, 1, col = "red", lwd = 2)
+par(mfrow = c(1, 1))
+```
+
